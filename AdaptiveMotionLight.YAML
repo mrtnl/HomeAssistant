@@ -1,9 +1,13 @@
 blueprint:
-  name: Motion + illuminance band light (brightness inverse, color temp mapped)
+  name: Motion + illuminance mapped light (<= high threshold, inverse brightness)
   description: >
-    Turns on a light when motion is detected AND illuminance is within a lux band.
-    Brightness is mapped inversely to the lux band (darker -> brighter).
-    Color temperature is mapped across the lux band (low lux -> warm, high lux -> cool).
+    On motion: turns on light if lux is below the high threshold.
+    Brightness is inverse-mapped from lux_low..lux_high and clamped:
+      lux <= lux_low => brightness_max
+      lux >= lux_high => no turn-on
+    Color temperature is mapped and clamped:
+      lux <= lux_low => warmest
+      lux >= lux_high => coolest (only relevant if you still allow turning on at high; here we don't).
     Optional fixed on-duration timer.
   domain: automation
 
@@ -29,7 +33,7 @@ blueprint:
           device_class: illuminance
 
     lux_low:
-      name: Lux low threshold
+      name: Lux low threshold (below this = max brightness)
       default: 10
       selector:
         number:
@@ -40,7 +44,7 @@ blueprint:
           mode: box
 
     lux_high:
-      name: Lux high threshold
+      name: Lux high threshold (at/above this = no turn-on)
       default: 200
       selector:
         number:
@@ -51,7 +55,7 @@ blueprint:
           mode: box
 
     brightness_min_pct:
-      name: Minimum brightness (% at lux_high)
+      name: Minimum brightness (% at lux_high - just below)
       default: 10
       selector:
         number:
@@ -61,7 +65,7 @@ blueprint:
           unit_of_measurement: "%"
 
     brightness_max_pct:
-      name: Maximum brightness (% at lux_low)
+      name: Maximum brightness (% at lux_low and below)
       default: 100
       selector:
         number:
@@ -71,7 +75,7 @@ blueprint:
           unit_of_measurement: "%"
 
     ct_cool_mired:
-      name: Coolest color temp (mired, used at lux_high)
+      name: Coolest color temp (mired, at lux_high - just below)
       default: 153
       selector:
         number:
@@ -81,7 +85,7 @@ blueprint:
           unit_of_measurement: "mired"
 
     ct_warm_mired:
-      name: Warmest color temp (mired, used at lux_low)
+      name: Warmest color temp (mired, at lux_low and below)
       default: 370
       selector:
         number:
@@ -127,7 +131,6 @@ trigger:
 
 variables:
   light_entity: !input target_light
-  motion_entity: !input motion_sensor
   lux_entity: !input illuminance_sensor
 
   lux_low_v: !input lux_low
@@ -148,6 +151,10 @@ action:
       lux: "{{ states(lux_entity) | float(0) }}"
       low: "{{ [lux_low_v | float, lux_high_v | float] | min }}"
       high: "{{ [lux_low_v | float, lux_high_v | float] | max }}"
+
+      # ratio across band, clamped:
+      # lux <= low  => 0
+      # lux >= high => 1
       ratio: >-
         {% set span = (high - low) %}
         {% if span <= 0 %}
@@ -156,20 +163,25 @@ action:
           {% set r = (lux - low) / span %}
           {{ [0, [1, r] | min] | max }}
         {% endif %}
+
+      # inverse brightness: ratio 0 => max, ratio 1 => min
       brightness_pct: >-
         {% set span = (bri_max | float) - (bri_min | float) %}
         {{ (bri_max | float) - (ratio | float) * span }}
+
       brightness_255: >-
         {% set pct = brightness_pct | float %}
         {% set pct = [1, [100, pct] | min] | max %}
         {{ (pct * 2.55) | round(0) | int }}
+
+      # color temp: ratio 0 => warm, ratio 1 => cool (mireds: warm higher)
       color_temp_mired: >-
         {% set span = (ct_warm | float) - (ct_cool | float) %}
         {{ (ct_warm | float) - (ratio | float) * span }}
 
+  # allow turning on for anything BELOW the high threshold
   - condition: numeric_state
     entity_id: !input illuminance_sensor
-    above: !input lux_low
     below: !input lux_high
 
   - choose:
@@ -190,9 +202,6 @@ action:
         data:
           brightness: "{{ brightness_255 }}"
 
-  # Turn-off behavior:
-  # - if on_duration_v > 0: fixed timer off
-  # - else if turn_off_v: motion-off with delay
   - choose:
       - conditions:
           - condition: template
