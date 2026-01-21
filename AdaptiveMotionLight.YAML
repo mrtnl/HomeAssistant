@@ -2,8 +2,9 @@ blueprint:
   name: Motion + illuminance band light (brightness inverse, color temp mapped)
   description: >
     Turns on a light when motion is detected AND illuminance is within a lux band.
-    Brightness is mapped inversely to the lux band.
-    Color temperature is mapped to the lux band.
+    Brightness is mapped inversely to the lux band (darker -> brighter).
+    Color temperature is mapped across the lux band (low lux -> warm, high lux -> cool).
+    Optional fixed on-duration timer.
   domain: automation
 
   input:
@@ -14,80 +15,97 @@ blueprint:
           domain: light
 
     motion_sensor:
-      name: Motion sensor
+      name: Motion sensor (binary)
       selector:
         entity:
           domain: binary_sensor
           device_class: motion
 
     illuminance_sensor:
-      name: Illuminance sensor
+      name: Illuminance sensor (lux)
       selector:
         entity:
           domain: sensor
           device_class: illuminance
 
     lux_low:
-      name: Lux low
+      name: Lux low threshold
       default: 10
       selector:
         number:
           min: 0
           max: 20000
+          step: 1
+          unit_of_measurement: lx
+          mode: box
 
     lux_high:
-      name: Lux high
+      name: Lux high threshold
       default: 200
       selector:
         number:
           min: 1
           max: 20000
+          step: 1
+          unit_of_measurement: lx
+          mode: box
 
     brightness_min_pct:
-      name: Min brightness (% at high lux)
+      name: Minimum brightness (% at lux_high)
       default: 10
       selector:
         number:
           min: 1
           max: 100
+          step: 1
+          unit_of_measurement: "%"
 
     brightness_max_pct:
-      name: Max brightness (% at low lux)
+      name: Maximum brightness (% at lux_low)
       default: 100
       selector:
         number:
           min: 1
           max: 100
+          step: 1
+          unit_of_measurement: "%"
 
     ct_cool_mired:
-      name: Cool CT (high lux)
+      name: Coolest color temp (mired, used at lux_high)
       default: 153
       selector:
         number:
           min: 100
           max: 500
+          step: 1
+          unit_of_measurement: "mired"
 
     ct_warm_mired:
-      name: Warm CT (low lux)
+      name: Warmest color temp (mired, used at lux_low)
       default: 370
       selector:
         number:
           min: 100
           max: 500
+          step: 1
+          unit_of_measurement: "mired"
 
     turn_off:
-      name: Turn off when no motion
+      name: Turn off when no motion (only if fixed duration = 0)
       default: true
       selector:
         boolean:
 
     off_delay_seconds:
-      name: No-motion off delay (seconds)
+      name: No-motion delay before turning off (seconds)
       default: 120
       selector:
         number:
           min: 0
           max: 86400
+          step: 5
+          unit_of_measurement: s
+          mode: box
 
     on_duration_seconds:
       name: Fixed on duration (seconds, 0 = disabled)
@@ -96,6 +114,9 @@ blueprint:
         number:
           min: 0
           max: 86400
+          step: 5
+          unit_of_measurement: s
+          mode: box
 
 mode: restart
 
@@ -106,63 +127,93 @@ trigger:
 
 variables:
   light_entity: !input target_light
+  motion_entity: !input motion_sensor
   lux_entity: !input illuminance_sensor
+
   lux_low_v: !input lux_low
   lux_high_v: !input lux_high
+
   bri_min: !input brightness_min_pct
   bri_max: !input brightness_max_pct
+
   ct_cool: !input ct_cool_mired
   ct_warm: !input ct_warm_mired
-  on_duration: !input on_duration_seconds
+
+  turn_off_v: !input turn_off
+  off_delay_v: !input off_delay_seconds
+  on_duration_v: !input on_duration_seconds
 
 action:
   - variables:
       lux: "{{ states(lux_entity) | float(0) }}"
-      low: "{{ [lux_low_v, lux_high_v] | min }}"
-      high: "{{ [lux_low_v, lux_high_v] | max }}"
+      low: "{{ [lux_low_v | float, lux_high_v | float] | min }}"
+      high: "{{ [lux_low_v | float, lux_high_v | float] | max }}"
       ratio: >-
-        {% set span = high - low %}
-        {{ 0 if span <= 0 else [0, [1, (lux - low) / span] | min] | max }}
+        {% set span = (high - low) %}
+        {% if span <= 0 %}
+          0
+        {% else %}
+          {% set r = (lux - low) / span %}
+          {{ [0, [1, r] | min] | max }}
+        {% endif %}
+      brightness_pct: >-
+        {% set span = (bri_max | float) - (bri_min | float) %}
+        {{ (bri_max | float) - (ratio | float) * span }}
       brightness_255: >-
-        {{ ((bri_max - ratio * (bri_max - bri_min)) * 2.55) | round | int }}
+        {% set pct = brightness_pct | float %}
+        {% set pct = [1, [100, pct] | min] | max %}
+        {{ (pct * 2.55) | round(0) | int }}
       color_temp_mired: >-
-        {{ (ct_warm - ratio * (ct_warm - ct_cool)) | round | int }}
+        {% set span = (ct_warm | float) - (ct_cool | float) %}
+        {{ (ct_warm | float) - (ratio | float) * span }}
 
   - condition: numeric_state
     entity_id: !input illuminance_sensor
     above: !input lux_low
     below: !input lux_high
 
-  - service: light.turn_on
-    target:
-      entity_id: !input target_light
-    data:
-      brightness: "{{ brightness_255 }}"
-      color_temp: "{{ color_temp_mired }}"
-
-  # fixed duration off
   - choose:
       - conditions:
           - condition: template
-            value_template: "{{ on_duration | int > 0 }}"
+            value_template: "{{ 'color_temp' in (state_attr(light_entity, 'supported_color_modes') or []) }}"
+        sequence:
+          - service: light.turn_on
+            target:
+              entity_id: !input target_light
+            data:
+              brightness: "{{ brightness_255 }}"
+              color_temp: "{{ color_temp_mired | round(0) | int }}"
+    default:
+      - service: light.turn_on
+        target:
+          entity_id: !input target_light
+        data:
+          brightness: "{{ brightness_255 }}"
+
+  # Turn-off behavior:
+  # - if on_duration_v > 0: fixed timer off
+  # - else if turn_off_v: motion-off with delay
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ on_duration_v | int > 0 }}"
         sequence:
           - delay:
-              seconds: "{{ on_duration }}"
+              seconds: "{{ on_duration_v | int }}"
           - service: light.turn_off
             target:
               entity_id: !input target_light
 
-      # motion-based off fallback
       - conditions:
           - condition: template
-            value_template: "{{ on_duration | int == 0 and ( !input turn_off ) }}"
+            value_template: "{{ (on_duration_v | int == 0) and (turn_off_v | bool) }}"
         sequence:
           - wait_for_trigger:
               - platform: state
                 entity_id: !input motion_sensor
                 to: "off"
           - delay:
-              seconds: !input off_delay_seconds
+              seconds: "{{ off_delay_v | int }}"
           - condition: state
             entity_id: !input motion_sensor
             state: "off"
