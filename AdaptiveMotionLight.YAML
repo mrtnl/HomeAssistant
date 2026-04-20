@@ -194,7 +194,7 @@ action:
               entity_id: !input target_light
             data:
               brightness: "{{ brightness_255 }}"
-              color_temp: "{{ color_temp_mired | round(0) | int }}"
+              color_temp_kelvin: "{{ (1000000 / (color_temp_mired | float)) | round(0) | int }}"
     default:
       - service: light.turn_on
         target:
